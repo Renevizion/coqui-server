@@ -1,5 +1,6 @@
 import os
 import re
+import tempfile
 from typing import Optional
 
 import aiofiles
@@ -36,9 +37,7 @@ tts_client = TTS(
 
 
 def remove_markdown_styles(text: str):
-    #text_styles = list()
     message = str(text)
-
     for style in STYLES:
         regex = style["regex"]
         offset = style["offset"]
@@ -47,37 +46,23 @@ def remove_markdown_styles(text: str):
         while match:
             group = match.group()
             message = message.replace(group, group[offset:-offset], 1)
-            #text_styles.append({"style": style["style"], "start": match.start(), "length": match.end() - match.start() - offset*2})
             match = re.search(regex, message)
 
-    #return {"message": message, "text_styles": text_styles}
     return message
 
 
 def clean_text_for_tts(text):
     """Cleans text for better TTS output."""
-
-    # Remove empty lines
     text = os.linesep.join([s for s in text.splitlines() if s])
-
-    # Remove emoji
     text = demoji.replace(text, "")
-
     text = remove_markdown_styles(text)
 
-    #text = text.replace("&", " and ") # Space on both ends to cover cases like Barnes&Noble
-    # The TTS models seem to pronounce "&" properly
     text = text.replace("%", " percent")
-    text = text.replace("*", "-") # "*" is used by the AI to denote lists and spoken by Coqui
-    text = text.replace("  +", "  -") # When preceeded by two spaces, a "+" is used to denote sublists
-
-    #text = text.replace("\n", " ").replace("\r", "").strip()
+    text = text.replace("*", "-")
+    text = text.replace("  +", "  -")
     text = text.replace("\r", "").strip()
     text = re.sub(" +", " ", text)
-    # Avoid replacing newlines with spaces b/c the TTS AI does well with pausing between breaks.
-    # The statement above removes all spaces, so when an outline is processed the speech sounds unnatural.
 
-    # Update all temperatures
     text = text.replace("°F", "° Fahrenheit")
     text = text.replace("°C", "° Celsius")
     text = text.replace("°K", "° Kelvin")
@@ -114,25 +99,37 @@ async def tts(
             detail="Speaker ID must be provided.",
         )
 
-    async with aiofiles.tempfile.NamedTemporaryFile(mode="w+t", delete=True) as output_wav:
-        wav_file = tts_client.tts_to_file(
-            text=clean_text_for_tts(text),
-            speaker=f"p{speaker_id}",
-            speed=speed,
-            file_path=output_wav.name
-        )
+    # Create a real temp WAV file
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+        wav_path = tmp_wav.name
 
-        if compress:
-            async with aiofiles.tempfile.NamedTemporaryFile(mode="w+t", delete=True) as output_flac:
-                flac_file = output_flac.name
-                encoder = pyflac.FileEncoder(input_file=wav_file, output_file=flac_file)
-                encoder.process()
-                encoder.finish()
+    # Generate TTS and save to WAV path
+    tts_client.tts_to_file(
+        text=clean_text_for_tts(text),
+        speaker=f"p{speaker_id}",
+        speed=speed,
+        file_path=wav_path
+    )
 
-                async with aiofiles.open(flac_file, "rb") as flac:
-                    content = await flac.read()
-                    return Response(content=content, media_type="audio/flac")
+    if compress:
+        with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp_flac:
+            flac_path = tmp_flac.name
 
-        async with aiofiles.open(wav_file, "rb") as audio:
-            content = await audio.read()
-            return Response(content=content, media_type="audio/wav")
+        # Compress using pyflac
+        encoder = pyflac.FileEncoder(input_file=wav_path, output_file=flac_path)
+        encoder.process()
+        encoder.finish()
+
+        async with aiofiles.open(flac_path, "rb") as flac:
+            content = await flac.read()
+
+        os.remove(wav_path)
+        os.remove(flac_path)
+        return Response(content=content, media_type="audio/flac")
+
+    # If not compressing, just return the WAV file
+    async with aiofiles.open(wav_path, "rb") as audio:
+        content = await audio.read()
+
+    os.remove(wav_path)
+    return Response(content=content, media_type="audio/wav")
